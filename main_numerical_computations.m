@@ -5,9 +5,10 @@ addpath('./code/')
 dbstop if error
 
 %% PARAMETERS
-r   = 0.06;
-xmu = 0.05;
-sig = 0.1;
+% Model parameters (names must match parfun expectations)
+r   = 0.06;      % Interest rate
+xmu = 0.05;      % Drift parameter
+sig = 0.1;       % Volatility
 
 ell1 = 1;
 ell0 = ell1*r;
@@ -43,153 +44,153 @@ tolaub = 1e-2;
 display_plot = 'off';
 display_iter = 'off';
 
+% Parallel computation option
+use_parallel = false;  % Set to true to enable parallel processing
+
 %% END
 writepar(mfilename)
 par = parfun;
-options = optimset('tolF',1e-20, 'tolX',1e-20);
+options = optimset('tolF', 1e-20, 'tolX', 1e-20);
 
-delete(gcp('nocreate'))
+% Setup parallel pool
+ParallelUtils.setupParallelPool(use_parallel);
 
 % Create parameter grids
-lvec = createLambdaGrid();
-nl = length(lvec);
+[lambdaGrid, varphiGridLow, varphiGridHigh, alphaGrid] = ParameterGridUtils.createAllGrids();
+numLambda = length(lambdaGrid);
+numAlpha = length(alphaGrid);
 
-[vvec_low, vvec_high] = createVarphiGrids();
-
-% Create alpha grid
-avec = createAlphaGrid();
-na = length(avec);
+% Pre-compute file existence cache
+fprintf('Pre-computing file existence cache...\n');
+fileExistenceCache = FileCacheUtils.createFileExistenceCache(...
+    lambdaGrid, varphiGridLow, varphiGridHigh, alphaGrid);
 
 % Main computation loop
-for il=1:nl
+for lambdaIdx = 1:numLambda
+    currentLambda = lambdaGrid(lambdaIdx);
     
     % Solve initial system to get starting values
-    par.lambda = lvec(il);
-    x1 = fsolve(@(x) Fsyst(x, par, 'case', 'jump commit'), [amax;amax/2;0], options);
-    [~,sol1] = Fsyst(x1,par,'case','jump commit');
-    disp(sum(abs(sol1.F)))
+    par.lambda = currentLambda;
+    initialGuess = [amax; amax/2; 0];
+    solutionVector = fsolve(@(x) Fsyst(x, par, 'case', 'jump commit'), initialGuess, options);
+    [~, initialSolution] = Fsyst(solutionVector, par, 'case', 'jump commit');
+    
+    if strcmp(display_iter, 'on')
+        disp(sum(abs(initialSolution.F)))
+    end
     
     % Set initial values for this lambda
-    alb00  = 0.02;
-    aub00  = sol1.aub;
-    EpSa00 = sol1.EpSa;
+    defaultLowerBound = 0.02;
+    defaultUpperBound = initialSolution.aub;
+    defaultEpSa = initialSolution.EpSa;
     
     % Select varphi grid based on lambda value
-    if lvec(il) <= 0.15
-        vvec = vvec_low;
-    else
-        vvec = vvec_high;
-    end
-    nv = length(vvec);
+    varphiGrid = ParameterGridUtils.selectVarphiGrid(currentLambda, varphiGridLow, varphiGridHigh);
+    numVarphi = length(varphiGrid);
     
-    % Parallel loop over varphi values
-    parfor iv=1:nv
-        optClass = CommitCollateralClass();
-        optClass.alb00 = alb00;
-        optClass.aub00 = aub00;
-        optClass.EpSa00 = EpSa00;
-        
-        % Loop over alpha values
-        for ia=1:na
-            filename = getSaveFileName(avec(ia), vvec(iv), lvec(il));
+    % Process all combinations for this lambda
+    processLambdaCombinations(lambdaIdx, lambdaGrid, varphiGrid, alphaGrid, par, ...
+        defaultLowerBound, defaultUpperBound, defaultEpSa, tolaub, ...
+        fileExistenceCache, use_parallel);
+end
+
+eval('save ''./files/savefile_grid''')
+fprintf('Computation complete.\n')
+
+%% Helper Functions
+
+function processLambdaCombinations(lambdaIdx, lambdaGrid, varphiGrid, alphaGrid, par, ...
+    defaultLowerBound, defaultUpperBound, defaultEpSa, toleranceAub, fileCache, useParallel)
+    % PROCESSLAMBDACOMBINATIONS Process all varphi/alpha combinations for one lambda
+    %
+    % Optimized to minimize file I/O and class instantiation
+    % Supports parallel processing over varphi values
+    
+    numVarphi = length(varphiGrid);
+    numAlpha = length(alphaGrid);
+    currentLambda = lambdaGrid(lambdaIdx);
+    
+    % Determine if we should use parallel processing
+    shouldUseParallel = useParallel && numVarphi > 1;
+    
+    if shouldUseParallel
+        % Parallel loop over varphi values (each worker processes one varphi)
+        parfor varphiIdx = 1:numVarphi
+            % Each worker needs its own class instance
+            solver = CommitCollateralClass();
+            solver.alb00  = defaultLowerBound;
+            solver.aub00  = defaultUpperBound;
+            solver.EpSa00 = defaultEpSa;
             
-            % Check if file exists and is valid
-            if exist(filename, 'file')
-                f = load(filename);
-                f.fstar_ = (f.estar(f.aub, f.astar_) + 1 - f.par.varphi0) / f.astar_;
-                
-                % Check if recomputation is needed
-                needsRecompute = checkIfRecomputeNeeded(f, lvec(il), tolaub);
-                
-                if needsRecompute
-                    optClass.optInit(lvec, il, vvec, iv, avec, ia);
-                    optClass.optFunLambda(avec(ia), par, lvec, il, vvec, iv);
-                end
-            else
-                % File doesn't exist, compute solution
-                optClass.optInit(lvec, il, vvec, iv, avec, ia);
-                optClass.optFunLambda(avec(ia), par, lvec, il, vvec, iv);
+            % Process all alpha values for this varphi
+            for alphaIdx = 1:numAlpha
+                processSingleCombination(solver, lambdaIdx, lambdaGrid, varphiGrid, varphiIdx, ...
+                    alphaGrid, alphaIdx, par, currentLambda, toleranceAub, fileCache);
+            end
+        end
+    else
+        % Sequential processing - reuse single class instance
+        solver = CommitCollateralClass();
+        solver.alb00  = defaultLowerBound;
+        solver.aub00  = defaultUpperBound;
+        solver.EpSa00 = defaultEpSa;
+        
+        % Process all combinations
+        for varphiIdx = 1:numVarphi
+            for alphaIdx = 1:numAlpha
+                processSingleCombination(solver, lambdaIdx, lambdaGrid, varphiGrid, varphiIdx, ...
+                    alphaGrid, alphaIdx, par, currentLambda, toleranceAub, fileCache);
             end
         end
     end
 end
 
-eval('save ''./files/savefile_grid''')
-
-%% Helper Functions
-
-function lvec = createLambdaGrid()
-    % CREATELAMBDAGRID Create refined lambda parameter grid
+function processSingleCombination(solver, lambdaIdx, lambdaGrid, varphiGrid, varphiIdx, ...
+    alphaGrid, alphaIdx, par, currentLambda, toleranceAub, fileCache)
+    % PROCESSSINGLECOMBINATION Process a single varphi/alpha combination
     %
-    % Creates a grid with initial spacing, then adds midpoints twice,
-    % and appends a high-resolution tail.
+    % Extracted to support both parallel and sequential execution
     
-    % Base grid
-    baseGrid = linspace(0.01, 0.5, 20);
+    filename = getSaveFileName(alphaGrid(alphaIdx), varphiGrid(varphiIdx), currentLambda);
     
-    % Add midpoints (refine grid twice)
-    refinedGrid = baseGrid;
-    for refinement = 1:2
-        midpoints = (refinedGrid(2:end) + refinedGrid(1:end-1)) / 2;
-        refinedGrid = sort([refinedGrid, midpoints]);
+    % Check cache instead of file system
+    if fileCache.isKey(filename) && fileCache(filename)
+        % File exists - check if valid
+        try
+            loadedSolution = load(filename, '-mat');
+            
+            % Quick validation without loading full structure
+            if isfield(loadedSolution, 'par') && isfield(loadedSolution, 'fstar') && ...
+                    isfield(loadedSolution, 'aub')
+                % Check if recomputation needed
+                needsRecompute = FileCacheUtils.checkIfRecomputeNeeded(...
+                    loadedSolution, currentLambda, toleranceAub);
+                
+                if needsRecompute
+                    solver.optInit(lambdaGrid, lambdaIdx, varphiGrid, varphiIdx, ...
+                        alphaGrid, alphaIdx, fileCache);
+                    solver.optFunLambda(alphaGrid(alphaIdx), par, lambdaGrid, lambdaIdx, ...
+                        varphiGrid, varphiIdx);
+                end
+            else
+                % Invalid file structure - recompute
+                solver.optInit(lambdaGrid, lambdaIdx, varphiGrid, varphiIdx, ...
+                    alphaGrid, alphaIdx, fileCache);
+                solver.optFunLambda(alphaGrid(alphaIdx), par, lambdaGrid, lambdaIdx, ...
+                    varphiGrid, varphiIdx);
+            end
+        catch
+            % File corrupted or unreadable - recompute
+            solver.optInit(lambdaGrid, lambdaIdx, varphiGrid, varphiIdx, ...
+                alphaGrid, alphaIdx, fileCache);
+            solver.optFunLambda(alphaGrid(alphaIdx), par, lambdaGrid, lambdaIdx, ...
+                varphiGrid, varphiIdx);
+        end
+    else
+        % File doesn't exist - compute solution
+        solver.optInit(lambdaGrid, lambdaIdx, varphiGrid, varphiIdx, ...
+            alphaGrid, alphaIdx, fileCache);
+        solver.optFunLambda(alphaGrid(alphaIdx), par, lambdaGrid, lambdaIdx, ...
+            varphiGrid, varphiIdx);
     end
-    
-    % Combine with high-resolution tail
-    lowRes = refinedGrid(1:34);
-    highRes = 0.25:0.05:1;
-    lvec = sort([lowRes, highRes]);
-end
-
-function [vvec_low, vvec_high] = createVarphiGrids()
-    % CREATEVARPHIGRIDS Create varphi grids for different lambda ranges
-    %
-    % Outputs:
-    %   vvec_low  - Grid for lambda <= 0.15 (sparse)
-    %   vvec_high - Grid for lambda > 0.15 (dense)
-    
-    nv_tmp = 20;
-    vvec_tmp = linspace(0.01, 0.99, nv_tmp);
-    vvec_low  = vvec_tmp(1:2:nv_tmp);  % Every other point
-    vvec_high = vvec_tmp(8:nv_tmp);    % Higher range
-end
-
-function avec = createAlphaGrid()
-    % CREATEALPHAGRID Create refined alpha parameter grid
-    %
-    % Creates base grid and adds midpoints for values <= 1.5
-    
-    na = 10;
-    avec_tmp = linspace(1, 2, na);
-    avec_low = (avec_tmp(2:end) + avec_tmp(1:end-1)) / 2;
-    avec_low = avec_low(avec_low <= 1.5);
-    avec = sort([avec_tmp, avec_low]);
-end
-
-function needsRecompute = checkIfRecomputeNeeded(f, lambda, tolaub)
-    % CHECKIFRECOMPUTENEEDED Determine if solution needs recomputation
-    %
-    % Inputs:
-    %   f       - Loaded file structure
-    %   lambda  - Current lambda value
-    %   tolaub  - Tolerance for aub convergence
-    %
-    % Outputs:
-    %   needsRecompute - Boolean indicating if recomputation needed
-    
-    % Check if lambda matches
-    lambdaMismatch = ~strcmp(...
-        num2str(round(lambda, 3)*1e3, '%.0f'), ...
-        num2str(round(f.par.lambda, 3)*1e3, '%.0f'));
-    
-    % Check if aub converged properly
-    aubConvergenceIssue = false;
-    if isfield(f, 'aout') && isfield(f, 'aub0')
-        aubConvergenceIssue = abs(f.aout(end) - f.aub0) / f.aub0 > tolaub;
-    end
-    if isfield(f, 'aub') && isfield(f, 'aub0')
-        aubConvergenceIssue = aubConvergenceIssue || ...
-            abs(f.aub - f.aub0) / abs(f.aub0) > tolaub;
-    end
-    
-    needsRecompute = lambdaMismatch || aubConvergenceIssue;
 end
