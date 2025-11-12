@@ -1,49 +1,33 @@
+% ============================================================================
+% COMMIT COLLATERAL NUMERICAL GRID PLOT
+% ============================================================================
+% This script loads or computes optimal solutions across a parameter grid
+% and generates plots showing the relationship between lambda, varphi, and
+% the optimal solutions.
+% ============================================================================
+
 clearvars
-set(0,'DefaultFigureWindowStyle','docked')
+set(0, 'DefaultFigureWindowStyle', 'docked')
 addpath('./files/')
 addpath('./code/')
 dbstop if error
 
-%% PARAMETERS
-% Model parameters (names must match parfun expectations)
-r   = 0.06;      % Interest rate
-xmu = 0.05;      % Drift parameter
-sig = 0.1;       % Volatility
+% ============================================================================
+% PARAMETER SETUP
+% ============================================================================
+setup_parameters();
 
-ell1 = 1;
-ell0 = ell1*r;
+% Script-specific configuration
+use_parallel = true; % Enable/disable parallel processing
 
-ell  = @(a) exp(-ell1./a).*ell0/ell1;
-ellp = @(a) 1./a.^2.*exp(-ell1./a).*ell0;
-amax  = ell1;
+% Configuration options
+loadsolution = 'on';  % 'on' to load saved solutions, 'off' to recompute
+savegraph = 'off';   % 'on' to save graphs, 'off' to only display
+display = 'off';     % 'on'/'all' to show detailed plots, 'off' to suppress
 
-xi = 6;
-lambda = 0.1;
-
-muk = 0.055;
-
-delt0 = (r + sig^2/2 - exp(-1)*r)*1.15;
-varphi0 = 1;
-
-% Parameter validation
-if r - xmu + lambda/(xi+1) < 0
-    warning('ParameterCheck:NegativePhi', 'phi is negative! This may cause numerical issues.');
-end
-
-if r + xmu - sig^2 - lambda/(xi-1) < 0
-    warning('ParameterCheck:NegativeKappa', 'kappa is negative! This may cause numerical issues.');
-end
-
-% Configuration
-loadsolution = 'on';
-savegraph = 'off';
-display = 'off';
-
-% Parallel computation option
-use_parallel = true;  % Set to false to disable parallel processing
-
-%% END
-
+% ============================================================================
+% INITIALIZATION
+% ============================================================================
 writepar(mfilename)
 par = parfun;
 options = optimset('tolF', 1e-20, 'tolX', 1e-20);
